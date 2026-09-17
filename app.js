@@ -14,6 +14,32 @@
     ['의류·잡화', ['백팩', '크로스백', '캐리어', '속옷', '양말(덧신)', '가디건', '상의', '하의', '원피스', '수영복', '선글라스', '크록스', '액세서리', '머리핀']]
   ];
 
+  const FIREBASE_CONFIG = window.BLOOM_FIREBASE_CONFIG || {};
+  const cloud = { app: null, auth: null, db: null, user: null, saveTimer: null, hydrated: false };
+  const initFirebase = () => {
+    if (!window.firebase || !FIREBASE_CONFIG.projectId) return;
+    try {
+      cloud.app = window.firebase.apps?.length ? window.firebase.app() : window.firebase.initializeApp(FIREBASE_CONFIG);
+      cloud.auth = window.firebase.auth();
+      cloud.db = window.firebase.firestore();
+      cloud.auth.onAuthStateChanged(user => {
+        cloud.user = user || null;
+        updateAccountChrome();
+        if (user) hydrateCloudState(user);
+        else { cloud.hydrated = false; updateSyncPill('이 기기에 저장 중'); }
+      });
+    } catch (error) { console.warn('Firebase 초기화에 실패했습니다.', error); }
+  };
+  const updateSyncPill = text => { const node = document.querySelector('.sync-pill span'); if (node) node.textContent = text; };
+  const updateAccountChrome = () => {
+    const user = cloud.user;
+    const avatar = document.getElementById('header-avatar');
+    if (avatar && user?.photoURL) avatar.src = user.photoURL;
+    const profile = document.querySelector('.header-profile');
+    if (profile) profile.title = user ? `${user.displayName || user.email} 계정` : 'Google 로그인';
+    updateSyncPill(user ? 'Firebase에 동기화 중' : '이 기기에 저장 중');
+  };
+
   const id = (prefix = 'id') => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
   const clone = value => JSON.parse(JSON.stringify(value));
   const today = new Date();
@@ -113,10 +139,52 @@
   let toastTimer;
 
   function currentTrip() { return state.trips.find(t => t.id === state.currentTripId) || state.trips[0]; }
+  function cloudTripPayload(trip) {
+    const memberIds = [...new Set([...(Array.isArray(trip.memberIds) ? trip.memberIds : []), cloud.user?.uid].filter(Boolean))];
+    return { ...clone(trip), ownerUid: trip.ownerUid || cloud.user?.uid || '', memberIds, updatedAt: window.firebase.firestore.FieldValue.serverTimestamp() };
+  }
+  function queueCloudSave() {
+    if (!cloud.user || !cloud.db) return;
+    clearTimeout(cloud.saveTimer);
+    cloud.saveTimer = setTimeout(async () => {
+      try {
+        await Promise.all(state.trips.map(trip => cloud.db.collection('trips').doc(trip.id).set(cloudTripPayload(trip), { merge: true })));
+        updateSyncPill('Firebase에 저장됨');
+      } catch (error) {
+        console.warn('Firebase 저장에 실패했습니다.', error);
+        updateSyncPill('기기에 저장 중');
+      }
+    }, 500);
+  }
+  async function hydrateCloudState(user) {
+    if (!cloud.db) return;
+    try {
+      const snapshot = await cloud.db.collection('trips').where('memberIds', 'array-contains', user.uid).get();
+      if (snapshot.empty) {
+        state.trips.forEach(trip => { trip.ownerUid = user.uid; trip.memberIds = [...new Set([...(trip.memberIds || []), user.uid])]; });
+        queueCloudSave();
+      } else {
+        const trips = snapshot.docs.map(doc => normalizeTrip({ id: doc.id, ...doc.data() }));
+        state.trips = trips.length ? trips : state.trips;
+        if (!state.trips.some(trip => trip.id === state.currentTripId)) state.currentTripId = state.trips[0].id;
+        saveState(false);
+      }
+      cloud.hydrated = true;
+      selectedDate = currentTrip().start;
+      calendarCursor = dateFromIso(selectedDate);
+      render();
+      updateSyncPill('Firebase에 동기화됨');
+    } catch (error) {
+      console.warn('Firebase 데이터를 불러오지 못했습니다.', error);
+      updateSyncPill('기기에 저장 중');
+      showToast('Firebase 규칙을 확인하면 공동 저장을 사용할 수 있어요.');
+    }
+  }
   function saveState() {
     const serialized = JSON.stringify(state);
     try { if (typeof localStorage !== 'undefined') localStorage.setItem(STORAGE_KEY, serialized); } catch (_) { /* fallback below */ }
     try { if (typeof window !== 'undefined') window.name = `${STORAGE_KEY}:${serialized}`; } catch (_) {}
+    queueCloudSave();
   }
   function updateTrip(mutator) { const trip = currentTrip(); mutator(trip); saveState(); render(); }
   function showToast(message) { const node = document.getElementById('toast'); if (!node) return; node.textContent = message; node.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => node.classList.remove('show'), 2200); }
@@ -147,13 +215,39 @@
     const note = document.getElementById('sidebar-tip'); note.textContent = packingStats(trip).purchase ? `구매 예정 준비물이 ${packingStats(trip).purchase}개 있어요.` : '작은 준비가 편안한 여행을 만들어요.';
     const notificationCount = document.getElementById('notification-count'); const notifications = getNotifications(trip); notificationCount.textContent = notifications.length; notificationCount.hidden = !notifications.length;
     const main = document.getElementById('main-content');
-    if (activeView === 'dashboard') main.innerHTML = dashboardView(trip);
+    if (activeView === 'dashboard') { main.innerHTML = dashboardView(trip); fetchTravelServices(trip); }
     if (activeView === 'itinerary') main.innerHTML = itineraryView(trip);
     if (activeView === 'planning') main.innerHTML = planningView(trip);
     if (activeView === 'trip-mode') main.innerHTML = tripModeView(trip);
     if (activeView === 'memories') main.innerHTML = memoriesView(trip);
   }
 
+  async function fetchTravelServices(trip) {
+    const city = trip.cities?.[0] || trip.country || 'Bali';
+    const weatherNode = document.getElementById('weather-service');
+    const ratesNode = document.getElementById('rates-service');
+    try {
+      const geoRes = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=ko&format=json`);
+      const geo = await geoRes.json(); const place = geo.results?.[0];
+      if (!place) throw new Error('도시를 찾을 수 없습니다.');
+      const weatherRes = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}&current=temperature_2m,weather_code,wind_speed_10m&timezone=auto`);
+      const weather = await weatherRes.json(); const current = weather.current || {};
+      const weatherCode = Number(current.weather_code);
+      const weatherText = weatherCode === 0 ? '맑음' : weatherCode <= 3 ? '구름 조금' : weatherCode <= 48 ? '안개' : weatherCode <= 67 ? '비' : weatherCode <= 77 ? '눈' : '소나기';
+      if (weatherNode) weatherNode.innerHTML = `<span class="service-icon">☼</span><div><small>현재 날씨 · ${escapeHtml(place.name || city)}</small><strong>${escapeHtml(weatherText)} · ${Math.round(Number(current.temperature_2m || 0))}°C</strong></div>`;
+    } catch (error) {
+      if (weatherNode) weatherNode.innerHTML = `<span class="service-icon">☼</span><div><small>현재 날씨</small><strong>도시를 찾지 못했어요</strong></div>`;
+    }
+    try {
+      const codes = [...new Set((trip.budget?.currencies || []).map(rate => String(rate.code).toLowerCase()).filter(code => code && code !== 'krw'))].slice(0, 5);
+      const ratesRes = await fetch(`https://api.frankfurter.dev/v2/rates?base=krw&quotes=${codes.join(',')}`);
+      const rates = await ratesRes.json(); const values = rates.rates || {};
+      const text = codes.length ? codes.map(code => `${code.toUpperCase()} ${Number(values[code.toUpperCase()] || values[code] || 0).toFixed(4)}`).join(' · ') : '등록된 현지 통화 없음';
+      if (ratesNode) ratesNode.innerHTML = `<span class="service-icon">₩</span><div><small>KRW 기준 · Frankfurter 참고값</small><strong>${escapeHtml(text)}</strong></div>`;
+    } catch (error) {
+      if (ratesNode) ratesNode.innerHTML = `<span class="service-icon">₩</span><div><small>기준 환율 참고값</small><strong>잠시 후 다시 시도해 주세요</strong></div>`;
+    }
+  }
   function dashboardView(trip) {
     const tasks = taskStats(trip), packing = packingStats(trip), budget = budgetStats(trip);
     const upcoming = [...trip.schedule].sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`)).filter(item => item.date >= iso(today)).slice(0, 4);
@@ -163,6 +257,7 @@
       <div class="dashboard-grid"><section class="hero-card"><span class="eyebrow">${escapeHtml(trip.name)}</span><h2>${escapeHtml(trip.cities.join(' · '))}<br/><span style="color:var(--lilac-deep)">${escapeHtml(dateLabel)}</span></h2><p>${escapeHtml(trip.start)} → ${escapeHtml(trip.end)} · ${tripDaysLabel(trip)}</p><div class="hero-meta"><span class="meta-chip">✓ 할 일 ${tasks.done}/${tasks.total}</span><span class="meta-chip">♧ 짐 ${packing.packed}/${packing.total}</span><span class="meta-chip">₩ 예산 ${budget.ratio}% 사용</span></div><div class="hero-date"><small>여행 정보</small><strong>${trip.nights}박</strong><button data-action="edit-trip">날짜·도시 수정 ›</button></div></section><section class="progress-card"><h3>여행 준비율</h3><div class="progress-ring" style="--progress:${Math.round((tasks.ratio + packing.ratio) / 2)}%"><div class="progress-ring-content"><strong>${Math.round((tasks.ratio + packing.ratio) / 2)}%</strong><small>할 일 + 준비물</small></div></div><span class="progress-label">오늘은 작은 항목 하나만 준비해요</span></section></div>
       <div class="stat-row"><div class="stat-card"><span class="stat-icon">◷</span><small>여행까지</small><strong>${delta > 0 ? `D-${delta}` : '진행 중'}</strong></div><div class="stat-card"><span class="stat-icon">✓</span><small>할 일 완료</small><strong>${tasks.done}<small style="display:inline;font-size:11px;margin-left:3px">/${tasks.total}</small></strong></div><div class="stat-card"><span class="stat-icon">♧</span><small>준비물 챙김</small><strong>${packing.packed}<small style="display:inline;font-size:11px;margin-left:3px">/${packing.total}</small></strong></div><div class="stat-card"><span class="stat-icon">₩</span><small>남은 예산</small><strong>${money(budget.remain)}</strong></div></div>
       <div class="two-col"><section class="panel"><div class="panel-heading"><div><h3>다가오는 일정</h3><p>예약과 시간을 한눈에 확인해요.</p></div><button class="link-btn" data-view="itinerary">전체 보기 →</button></div><div class="schedule-list">${upcoming.length ? upcoming.map(scheduleRow).join('') : '<div class="empty-state">다가오는 일정이 없어요.</div>'}</div></section><section class="panel"><div class="panel-heading"><div><h3>준비 기록</h3><p>여행 준비 진행 상황</p></div><span class="tag sage">진행 중</span></div><div class="mini-chart">${bars.map(bar => `<div class="mini-bar"><i style="height:${Math.max(8, bar.value)}%"></i><small>${bar.label}</small></div>`).join('')}</div><div class="mini-legend"><span>완료율</span><span>여행 준비 흐름</span></div></section></div>
+      <section class="panel travel-services" id="travel-services"><div class="panel-heading"><div><h3>여행 서비스</h3><p>날씨와 기준 환율을 자동으로 불러와요. 지도를 열어 장소를 확인할 수 있어요.</p></div><button class="button soft small" data-action="refresh-travel-services">새로고침</button></div><div class="service-grid"><article class="service-card" id="weather-service"><span class="service-icon">☼</span><div><small>현재 날씨 · ${escapeHtml(trip.cities[0] || '')}</small><strong>불러오는 중…</strong></div></article><article class="service-card" id="rates-service"><span class="service-icon">₩</span><div><small>기준 환율 참고값</small><strong>불러오는 중…</strong></div></article><article class="service-card"><span class="service-icon">⌖</span><div><small>여행 지도</small><strong>${escapeHtml(trip.cities.join(' · '))}</strong></div><button class="button ghost small" data-action="open-map">지도 열기</button></article></div></section>
       <div class="shortcut-grid"><button class="shortcut" data-action="quick-expense"><b>₩</b><span>빠른 지출</span></button><button class="shortcut" data-view="planning" data-planning-tab="checklist"><b>✓</b><span>체크리스트</span></button><button class="shortcut" data-view="trip-mode"><b>✦</b><span>오늘 여행 중</span></button><button class="shortcut" data-action="invite-partner"><b>＋</b><span>파트너 초대</span></button></div>`;
   }
   function scheduleRow(item) { return `<div class="schedule-row"><div class="schedule-date"><strong>${dateFromIso(item.date).getDate()}</strong>${new Intl.DateTimeFormat('ko-KR', { month: 'short' }).format(dateFromIso(item.date))}</div><main><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.time)} · ${escapeHtml(item.place || item.note || '상세 메모 없음')}</small></main><span class="tag ${item.kind === '이동' ? 'rose' : ''}">${escapeHtml(item.kind || '일정')}</span></div>`; }
@@ -232,7 +327,52 @@
   function packingCategoryManager() { const trip = currentTrip(); const categories = packingCategoryList(trip); return `<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">PACKING CATEGORIES</span><h2>준비물 분류 관리</h2><p>분류를 추가하거나 이름을 바꾸고, 사용하지 않는 분류를 정리할 수 있어요.</p><div class="category-manager-list">${categories.map(category => { const count = trip.packing.filter(item => item.category === category).length; return `<div class="category-manager-row"><div><strong>${escapeHtml(category)}</strong><small>${count}개 물품</small></div><div class="category-manager-actions"><button class="button ghost small" data-action="edit-packing-category" data-category="${escapeHtml(category)}">수정</button><button class="button ghost small" data-action="delete-packing-category" data-category="${escapeHtml(category)}">삭제</button></div></div>`; }).join('')}</div><div class="modal-actions"><button class="button primary" data-action="add-packing-category">＋ 분류 추가</button><button class="button ghost" data-action="close-modal">닫기</button></div>`; }
   function diaryForm(item = null) { const data = item || { date: iso(today), title: '', text: '' }; return `<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TRAVEL DIARY</span><h2>${item ? '여행 기록 수정' : '여행 기록 추가'}</h2><form id="diary-form" class="modal-form"><input type="hidden" name="id" value="${item?.id || ''}"/><div class="field"><label>날짜</label><input name="date" type="date" value="${data.date}" required /></div><div class="field"><label>제목</label><input name="title" value="${escapeHtml(data.title)}" placeholder="오늘의 한 장면" required /></div><div class="field full"><label>메모</label><textarea name="text" required placeholder="사진과 함께 남기고 싶은 이야기를 적어보세요.">${escapeHtml(data.text || '')}</textarea></div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">취소</button>${item ? '<button type="button" class="button danger" data-action="delete-diary" data-id="' + item.id + '">삭제</button>' : ''}<button class="button primary" type="submit">저장하기</button></div></form>`; }
 
-  function accountModal() { const trip = currentTrip(); openModal(`<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">ACCOUNT & SHARING</span><h2>계정과 파트너 초대</h2><p>현재는 브라우저 데모 모드로 저장되고 있어요. Firebase 설정을 연결하면 이메일·Google 로그인과 실시간 공동 편집을 사용할 수 있습니다.</p><div class="notice-box">웹사이트 안에서만 알림을 표시합니다. 브라우저 푸시 알림은 사용하지 않아요.</div><div class="member-list">${trip.members.map(member => `<div class="member-row"><div><strong>${escapeHtml(member.name)}</strong><small>${escapeHtml(member.email)}</small></div><span class="tag">${escapeHtml(member.role)}</span></div>`).join('')}</div><form id="invite-form" class="modal-form" style="margin-top:15px"><div class="field full"><label>파트너 이메일</label><input name="email" type="email" placeholder="partner@example.com" required /></div><div class="modal-actions"><button class="button primary" type="submit">초대 링크 만들기</button></div></form><div class="modal-actions"><button class="button ghost" data-action="close-modal">닫기</button><button class="button soft" data-action="demo-login">Google 로그인 데모</button></div>`); }
+  function accountModal() {
+    const trip = currentTrip(); const user = cloud.user;
+    const identity = user ? `<div class="notice-box"><strong>${escapeHtml(user.displayName || 'Google 계정')}</strong><br/><small>${escapeHtml(user.email || '')}</small></div>` : '<div class="notice-box">로그인하면 여행 데이터가 Firebase에 저장되고 다른 기기에서도 이어서 사용할 수 있어요.</div>';
+    const action = user ? '<button class="button soft" data-action="firebase-logout">로그아웃</button>' : '<button class="button primary" data-action="firebase-login">Google 계정으로 로그인</button>';
+    openModal(`<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">ACCOUNT & SHARING</span><h2>계정과 파트너 초대</h2><p>Google 로그인 후 여행 데이터가 안전하게 동기화됩니다.</p>${identity}<div class="member-list">${trip.members.map(member => `<div class="member-row"><div><strong>${escapeHtml(member.name)}</strong><small>${escapeHtml(member.email)}</small></div><span class="tag">${escapeHtml(member.role)}</span></div>`).join('')}</div><form id="invite-form" class="modal-form" style="margin-top:15px"><div class="field full"><label>파트너 이메일</label><input name="email" type="email" placeholder="partner@example.com" required /></div><div class="modal-actions"><button class="button primary" type="submit">초대 링크 만들기</button></div></form><div class="modal-actions"><button class="button ghost" data-action="close-modal">닫기</button>${action}</div>`);
+  }
+  async function firebaseLogin() {
+    if (!cloud.auth) { showToast('Firebase 설정을 먼저 확인해 주세요.'); return; }
+    try {
+      const provider = new window.firebase.auth.GoogleAuthProvider();
+      await cloud.auth.signInWithPopup(provider);
+      closeModal();
+      showToast('Google 계정으로 로그인했어요.');
+    } catch (error) {
+      console.warn('Google 로그인에 실패했습니다.', error);
+      showToast(error?.code === 'auth/popup-closed-by-user' ? '로그인 창을 닫았어요.' : 'Google 로그인에 실패했어요.');
+    }
+  }
+  async function firebaseLogout() {
+    if (!cloud.auth) return;
+    try { await cloud.auth.signOut(); closeModal(); showToast('로그아웃했어요.'); }
+    catch (_) { showToast('로그아웃에 실패했어요.'); }
+  }
+  async function openMapModal() {
+    const city = currentTrip().cities?.[0] || currentTrip().country || 'Bali';
+    if (!FIREBASE_CONFIG.mapsApiKey) { window.open('https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(city), '_blank', 'noopener'); return; }
+    openModal(`<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">GOOGLE MAPS</span><h2>${escapeHtml(city)} 지도</h2><p>여행 도시를 지도에서 확인할 수 있어요.</p><div id="bloom-map" style="height:360px;border-radius:16px;overflow:hidden;background:#f4efe9"></div><div id="map-status" class="soft-note" style="margin-top:9px">지도를 불러오는 중…</div>`);
+    const init = async () => {
+      const mapNode = document.getElementById('bloom-map'); const status = document.getElementById('map-status');
+      if (!mapNode || !window.google?.maps) return;
+      let center = { lat: -8.65, lng: 115.2167 };
+      try {
+        const response = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=ko&format=json`);
+        const place = (await response.json()).results?.[0];
+        if (place) center = { lat: Number(place.latitude), lng: Number(place.longitude) };
+      } catch (_) { /* fallback to Bali */ }
+      const map = new window.google.maps.Map(mapNode, { center, zoom: 11, mapTypeControl: false, streetViewControl: false, fullscreenControl: false });
+      new window.google.maps.Marker({ map, position: center, title: city });
+      if (status) status.textContent = '지도에서 장소를 확대해 확인해 보세요.';
+    };
+    if (window.google?.maps) { init(); return; }
+    window.__bloomMapsReady = init;
+    if (!document.getElementById('google-maps-script')) {
+      const script = document.createElement('script'); script.id = 'google-maps-script'; script.async = true; script.defer = true; script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(FIREBASE_CONFIG.mapsApiKey)}&libraries=places&callback=__bloomMapsReady`; document.head.appendChild(script);
+    }
+  }
   function notificationsModal() { const notices = getNotifications(currentTrip()); openModal(`<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">IN-APP NOTIFICATIONS</span><h2>여행 알림</h2><p>예약과 준비물 중 확인할 항목만 보여드려요.</p><div class="notification-list">${notices.length ? notices.map(item => `<div class="alert-row"><b>!</b><div><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.detail)}</small></div></div>`).join('') : '<div class="empty-state">새로운 알림이 없어요.</div>'}</div>`); }
   function currencyModal() { const trip = currentTrip(); openModal(`<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">CURRENCY TOOL</span><h2>환율 관리</h2><p>여행에서 사용할 통화와 사용자가 정한 환율을 관리합니다.</p><form id="currency-form" class="modal-form"><div class="field"><label>통화 코드</label><input name="code" placeholder="JPY" required /></div><div class="field"><label>통화 이름</label><input name="name" placeholder="일본 엔" required /></div><div class="field"><label>1단위당 원화 환율</label><input name="rate" type="number" step="0.0001" min="0" placeholder="9.2" required /></div><div class="modal-actions"><button class="button primary" type="submit">통화 추가</button></div></form><div class="rate-list">${trip.budget.currencies.map(rate => `<div class="rate-row"><span>${escapeHtml(rate.code)} · ${escapeHtml(rate.name)}</span><strong>₩${Number(rate.rate).toLocaleString('ko-KR')}</strong></div>`).join('')}</div>`); }
   function saveComparisonForm(form) {
@@ -310,9 +450,11 @@
     if (action === 'delete-diary') { if (confirm('이 기록을 삭제할까요?')) { currentTrip().diary = currentTrip().diary.filter(x => x.id !== target.dataset.id); saveState(); closeModal(); render(); showToast('기록을 삭제했어요.'); } return; }
     if (action === 'toggle-place') { const item = currentTrip().places.find(x => x.id === target.dataset.id); if (item) { item.visited = !item.visited; saveState(); render(); } return; }
     if (action === 'archive-trip') { showToast('여행 보관함 기능은 다음 업데이트에서 연결됩니다.'); return; }
-    if (action === 'open-map') { window.open('https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(currentTrip().cities[0] || 'Bali'), '_blank', 'noopener'); return; }
+    if (action === 'open-map') { openMapModal(); return; }
     if (action === 'print-summary') { window.print(); return; }
-    if (action === 'demo-login') { closeModal(); showToast('Google 로그인 데모 모드입니다.'); return; }
+    if (action === 'firebase-login') { firebaseLogin(); return; }
+    if (action === 'firebase-logout') { firebaseLogout(); return; }
+    if (action === 'refresh-travel-services') { fetchTravelServices(currentTrip()); showToast('날씨와 환율을 새로 조회했어요.'); return; }
   });
 
   document.addEventListener('input', event => { if (event.target.matches('[data-day-note]')) { const trip = currentTrip(); trip.dayNotes = trip.dayNotes || {}; trip.dayNotes[event.target.dataset.dayNote] = event.target.value; saveState(); } });
@@ -358,5 +500,6 @@
   document.getElementById('modal-backdrop').addEventListener('click', event => { if (event.target.id === 'modal-backdrop') closeModal(); });
   document.addEventListener('keydown', event => { if (event.key === 'Escape') closeModal(); });
   if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
+  initFirebase();
   render();
 })();
