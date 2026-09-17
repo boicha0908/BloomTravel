@@ -28,7 +28,7 @@
       cloud.auth.onAuthStateChanged(user => {
         cloud.user = user || null;
         updateAccountChrome();
-        if (user) hydrateCloudState(user);
+        if (user) hydrateCloudState(user).then(() => consumePartnerInvite(user));
         else { cloud.hydrated = false; updateSyncPill('이 기기에 저장 중'); }
       });
       return true;
@@ -108,13 +108,14 @@
     contacts: [{ name: '주인도네시아 대한민국 대사관', phone: '+62 21 2967 2555', type: '긴급' }, { name: '숙소 프런트', phone: '+62 361 209 2288', type: '숙소' }],
     diary: [{ id: 'd1', date: '2027-05-12', title: '드디어 발리에 도착한 날', text: '공항을 나서는 순간부터 공기가 달랐다. 우리의 첫 여행 기록을 시작한다.' }],
     places: [{ id: 'p1', name: 'Seminyak Beach', city: '스미냑', visited: false }],
-    members: [{ name: '민준 · 서연', email: 'owner@bloom.travel', role: '여행 생성자' }]
+    members: [{ name: '민준 · 서연', email: 'owner@bloom.travel', role: '여행 생성자' }],
+    pendingInvites: []
   });
 
   const normalizeTrip = trip => {
     const base = defaultTrip();
     const merged = { ...base, ...trip, couple: { ...base.couple, ...(trip?.couple || {}) }, budget: { ...base.budget, ...(trip?.budget || {}) } };
-    ['schedule', 'bookings', 'expenses', 'comparisons', 'tasks', 'packing', 'contacts', 'diary', 'places', 'members'].forEach(key => { if (!Array.isArray(merged[key])) merged[key] = []; });
+    ['schedule', 'bookings', 'expenses', 'comparisons', 'tasks', 'packing', 'contacts', 'diary', 'places', 'members', 'pendingInvites'].forEach(key => { if (!Array.isArray(merged[key])) merged[key] = []; });
     if (!Array.isArray(merged.packingCategories)) merged.packingCategories = [...new Set([...PACKING_TEMPLATE.map(([category]) => category), ...merged.packing.map(item => item.category).filter(Boolean)])];
     merged.packingCategories = [...new Set([...merged.packingCategories.filter(Boolean), ...merged.packing.map(item => item.category).filter(Boolean)])];
     if (!merged.budget.currencies?.length) merged.budget.currencies = clone(base.budget.currencies);
@@ -165,8 +166,13 @@
     try {
       const snapshot = await cloud.db.collection('trips').where('memberIds', 'array-contains', user.uid).get();
       if (snapshot.empty) {
-        state.trips.forEach(trip => { trip.ownerUid = user.uid; trip.memberIds = [...new Set([...(trip.memberIds || []), user.uid])]; });
-        queueCloudSave();
+        // When arriving through an invite URL, wait for invite acceptance
+        // before treating the local demo trip as a new owned trip.
+        const isInviteFlow = new URLSearchParams(window.location.search).has('invite');
+        if (!isInviteFlow) {
+          state.trips.forEach(trip => { trip.ownerUid = user.uid; trip.memberIds = [...new Set([...(trip.memberIds || []), user.uid])]; });
+          queueCloudSave();
+        }
       } else {
         const trips = snapshot.docs.map(doc => normalizeTrip({ id: doc.id, ...doc.data() }));
         state.trips = trips.length ? trips : state.trips;
@@ -183,6 +189,43 @@
       updateSyncPill('기기에 저장 중');
       showToast('Firebase 규칙을 확인하면 공동 저장을 사용할 수 있어요.');
     }
+  }
+  async function consumePartnerInvite(user) {
+    const token = new URLSearchParams(window.location.search).get('invite');
+    if (!token || !cloud.db || !user?.email) return;
+    try {
+      const inviteRef = cloud.db.collection('tripInvites').doc(token);
+      const inviteSnapshot = await inviteRef.get();
+      if (!inviteSnapshot.exists) { showToast('초대 링크가 만료되었거나 존재하지 않아요.'); return; }
+      const invite = inviteSnapshot.data();
+      if (String(invite.email || '').toLowerCase() !== String(user.email).toLowerCase()) { showToast('초대받은 이메일과 로그인 계정이 달라요.'); return; }
+      const tripRef = cloud.db.collection('trips').doc(invite.tripId); const tripSnapshot = await tripRef.get();
+      if (!tripSnapshot.exists) { showToast('초대한 여행을 찾지 못했어요.'); return; }
+      const data = tripSnapshot.data();
+      const memberIds = [...new Set([...(data.memberIds || []), user.uid])];
+      const members = [...(data.members || []).filter(member => member.email !== user.email), { name: user.displayName || user.email.split('@')[0], email: user.email, role: '파트너', uid: user.uid }];
+      const pendingInvites = (data.pendingInvites || []).filter(email => String(email).toLowerCase() !== String(user.email).toLowerCase());
+      await tripRef.update({ memberIds, members, pendingInvites, updatedAt: window.firebase.firestore.FieldValue.serverTimestamp() });
+      await inviteRef.update({ status: 'accepted', acceptedUid: user.uid, acceptedAt: window.firebase.firestore.FieldValue.serverTimestamp() });
+      window.history.replaceState({}, document.title, window.location.pathname);
+      await hydrateCloudState(user);
+      showToast('여행에 파트너로 참여했어요.');
+    } catch (error) { console.warn('파트너 초대를 처리하지 못했습니다.', error); showToast('초대 링크를 처리하지 못했어요.'); }
+  }
+  async function createPartnerInvite(email) {
+    if (!cloud.user || !cloud.db) { showToast('Google 로그인 후 초대할 수 있어요.'); return; }
+    const normalizedEmail = String(email || '').trim().toLowerCase(); if (!normalizedEmail) return;
+    const trip = currentTrip(); const token = id('invite').replace(/[^a-z0-9-]/gi, '');
+    if (trip.ownerUid && trip.ownerUid !== cloud.user.uid) { showToast('여행 생성자만 파트너를 초대할 수 있어요.'); return; }
+    trip.ownerUid = trip.ownerUid || cloud.user.uid; trip.memberIds = [...new Set([...(trip.memberIds || []), cloud.user.uid])];
+    trip.pendingInvites = [...new Set([...(trip.pendingInvites || []), normalizedEmail])];
+    trip.members = [...trip.members.filter(member => member.email !== normalizedEmail), { name: normalizedEmail.split('@')[0], email: normalizedEmail, role: '초대 대기' }];
+    try {
+      await cloud.db.collection('tripInvites').doc(token).set({ tripId: trip.id, ownerUid: cloud.user.uid, email: normalizedEmail, status: 'pending', createdAt: window.firebase.firestore.FieldValue.serverTimestamp() });
+    } catch (error) { console.warn('파트너 초대 생성에 실패했습니다.', error); showToast('Firestore 규칙을 게시한 뒤 다시 시도해 주세요.'); return; }
+    saveState();
+    const link = `${window.location.origin}${window.location.pathname}?invite=${encodeURIComponent(token)}`;
+    openModal(`<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">PARTNER INVITE</span><h2>초대 링크가 준비됐어요</h2><p>${escapeHtml(normalizedEmail)}에게 아래 링크를 보내면 로그인 후 이 여행에 참여할 수 있어요.</p><div class="field"><label>초대 링크</label><input id="invite-link" value="${escapeHtml(link)}" readonly /></div><div class="modal-actions"><button class="button primary" data-action="copy-invite" data-link="${escapeHtml(link)}">링크 복사</button><button class="button ghost" data-action="close-modal">닫기</button></div>`);
   }
   function saveState() {
     const serialized = JSON.stringify(state);
@@ -321,7 +364,7 @@
 
   function openTripManager() { const trip = currentTrip(); openModal(`<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">MY TRIPS</span><h2>여행 보관함</h2><p>여행을 여러 개 만들고 현재 여행을 전환할 수 있어요.</p><div class="trip-list">${state.trips.map(item => `<article class="trip-card"><div class="trip-cover">${item.photo ? `<img src="${escapeHtml(item.photo)}" alt=""/>` : ''}<span class="tag">${item.id === state.currentTripId ? '현재 여행' : '여행'}</span></div><div class="trip-card-body"><h3>${escapeHtml(item.name)}</h3><p>${escapeHtml(names(item))} · ${tripDaysLabel(item)}</p><div class="trip-card-actions"><button class="button ${item.id === state.currentTripId ? 'soft' : 'primary'} small" data-action="switch-trip" data-id="${item.id}">${item.id === state.currentTripId ? '현재 여행' : '열기'}</button><button class="button ghost small" data-action="edit-trip" data-id="${item.id}">수정</button></div></div></article>`).join('')}</div><div class="modal-actions"><button class="button primary" data-action="new-trip">＋ 새 여행 만들기</button></div>`); }
 
-  function tripForm(item = null) { const t = item || { name: '', tagline: '', couple: { a: '', b: '' }, start: iso(today), end: iso(new Date(today.getTime() + 6 * 86400000)), nights: 5, country: '', cities: [], departureAirport: '', arrivalAirport: '', budget: { planned: 0 } }; return `<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TRIP PROFILE</span><h2>${item ? '여행 정보 수정' : '새 여행 만들기'}</h2><p>여행의 기본 정보는 언제든 수정할 수 있어요.</p><form id="trip-form" class="modal-form"><input type="hidden" name="id" value="${item?.id || ''}"/><div class="field"><label>여행 이름</label><input name="name" value="${escapeHtml(t.name)}" placeholder="예: 발리 신혼여행" required /></div><div class="field"><label>한 줄 소개</label><input name="tagline" value="${escapeHtml(t.tagline || '')}" placeholder="우리 둘의 첫 번째 긴 여행" /></div><div class="field"><label>신랑 이름</label><input name="coupleA" value="${escapeHtml(t.couple?.a || '')}" required /></div><div class="field"><label>신부 이름</label><input name="coupleB" value="${escapeHtml(t.couple?.b || '')}" required /></div><div class="field"><label>출발일</label><input name="start" type="date" value="${t.start}" required /></div><div class="field"><label>귀국일</label><input name="end" type="date" value="${t.end}" required /></div><div class="field"><label>국가</label><input name="country" value="${escapeHtml(t.country || '')}" placeholder="인도네시아" /></div><div class="field"><label>도시 (쉼표로 구분)</label><input name="cities" value="${escapeHtml((t.cities || []).join(', '))}" placeholder="덴파사르, 우붓, 스미냑" /></div><div class="field"><label>출발 공항</label><input name="departureAirport" value="${escapeHtml(t.departureAirport || '')}" /></div><div class="field"><label>도착 공항</label><input name="arrivalAirport" value="${escapeHtml(t.arrivalAirport || '')}" /></div><div class="field"><label>총 원화 예산</label><input name="planned" type="number" min="0" value="${t.budget?.planned || 0}" /></div><div class="field"><label>대표 사진</label><input name="photo" type="file" accept="image/*" /></div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">취소</button><button class="button primary" type="submit">저장하기</button></div></form>`; }
+  function tripForm(item = null) { const t = item || { name: '', tagline: '', couple: { a: '', b: '' }, start: iso(today), end: iso(new Date(today.getTime() + 6 * 86400000)), nights: 5, country: '', cities: [], departureAirport: '', arrivalAirport: '', budget: { planned: 0 } }; return `<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TRIP PROFILE</span><h2>${item ? '여행 정보 수정' : '새 여행 만들기'}</h2><p>여행의 기본 정보는 언제든 수정할 수 있어요.</p><form id="trip-form" class="modal-form"><input type="hidden" name="id" value="${item?.id || ''}"/><div class="field"><label>여행 이름</label><input name="name" value="${escapeHtml(t.name)}" placeholder="예: 발리 신혼여행" required /></div><div class="field"><label>한 줄 소개</label><input name="tagline" value="${escapeHtml(t.tagline || '')}" placeholder="우리 둘의 첫 번째 긴 여행" /></div><div class="field"><label>신랑 이름</label><input name="coupleA" value="${escapeHtml(t.couple?.a || '')}" /></div><div class="field"><label>신부 이름</label><input name="coupleB" value="${escapeHtml(t.couple?.b || '')}" /></div><div class="field"><label>출발일</label><input name="start" type="date" value="${t.start}" required /></div><div class="field"><label>귀국일</label><input name="end" type="date" value="${t.end}" required /></div><div class="field"><label>국가</label><input name="country" value="${escapeHtml(t.country || '')}" placeholder="인도네시아" /></div><div class="field"><label>도시 (쉼표로 구분)</label><input name="cities" value="${escapeHtml((t.cities || []).join(', '))}" placeholder="덴파사르, 우붓, 스미냑" /></div><div class="field"><label>출발 공항</label><input name="departureAirport" value="${escapeHtml(t.departureAirport || '')}" /></div><div class="field"><label>도착 공항</label><input name="arrivalAirport" value="${escapeHtml(t.arrivalAirport || '')}" /></div><div class="field"><label>총 원화 예산</label><input name="planned" type="number" min="0" value="${t.budget?.planned || 0}" /></div><div class="field"><label>대표 사진</label><input name="photo" type="file" accept="image/*" /></div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">취소</button><button class="button primary" type="submit">저장하기</button></div></form>`; }
   function scheduleForm(item = null) { const t = currentTrip(); const data = item || { date: selectedDate || t.start, time: '10:00', title: '', kind: '관광', place: '', transport: '', note: '', bookingId: '' }; return `<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">ITINERARY ITEM</span><h2>${item ? '일정 수정' : '새 일정 추가'}</h2><p>시간순 일정에 장소와 이동수단, 예약 메모를 함께 남겨보세요.</p><form id="schedule-form" class="modal-form"><input type="hidden" name="id" value="${item?.id || ''}"/><div class="field"><label>날짜</label><input name="date" type="date" value="${data.date}" required /></div><div class="field"><label>시간</label><input name="time" type="time" value="${data.time}" required /></div><div class="field full"><label>일정 이름</label><input name="title" value="${escapeHtml(data.title)}" placeholder="예: 우붓 사원 투어" required /></div><div class="field"><label>분류</label><select name="kind">${['항공', '숙소', '이동', '관광', '투어', '식사', '쇼핑', '기타'].map(x => `<option ${data.kind === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div><div class="field"><label>이동수단</label><input name="transport" value="${escapeHtml(data.transport || '')}" placeholder="도보, 택시, 투어 차량" /></div><div class="field"><label>장소</label><input name="place" value="${escapeHtml(data.place || '')}" placeholder="주소 또는 장소명" /></div><div class="field"><label>연결 예약</label><select name="bookingId"><option value="">연결하지 않음</option>${currentTrip().bookings.map(booking => `<option value="${booking.id}" ${data.bookingId === booking.id ? 'selected' : ''}>${escapeHtml(booking.title)}</option>`).join('')}</select></div><div class="field full"><label>메모</label><textarea name="note" placeholder="예약번호, 준비물, 체크인 조건 등">${escapeHtml(data.note || '')}</textarea></div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">취소</button>${item ? '<button type="button" class="button danger" data-action="delete-schedule" data-id="' + item.id + '">삭제</button>' : ''}<button class="button primary" type="submit">저장하기</button></div></form>`; }
   function bookingForm(item = null) { const data = item || { type: '항공권', title: '', date: selectedDate, endDate: '', location: '', status: '확인 필요', amount: '', currency: 'KRW', memo: '', voucher: '' }; const currency = ['KRW', ...currentTrip().budget.currencies.map(x => x.code)]; return `<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">BOOKING</span><h2>${item ? '예약 수정' : '예약 추가'}</h2><p>바우처 링크는 온라인용, 파일은 이 브라우저에 저장되어 오프라인에서도 열 수 있어요.</p><form id="booking-form" class="modal-form"><input type="hidden" name="id" value="${item?.id || ''}"/><div class="field"><label>예약 유형</label><select name="type">${['항공권', '숙소', '교통', '투어', '보험', '유심', '기타'].map(x => `<option ${data.type === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div><div class="field"><label>상태</label><select name="status">${['확인 필요', '비교중', '예약완료', '확정', '취소'].map(x => `<option ${data.status === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div><div class="field full"><label>예약명</label><input name="title" value="${escapeHtml(data.title)}" placeholder="예: 대한항공 KE629" required /></div><div class="field"><label>시작일</label><input name="date" type="date" value="${data.date}" required /></div><div class="field"><label>종료일</label><input name="endDate" type="date" value="${data.endDate || ''}" /></div><div class="field full"><label>장소·구간·주소</label><input name="location" value="${escapeHtml(data.location || '')}" placeholder="인천 → 덴파사르" /></div><div class="field"><label>금액</label><input name="amount" type="number" min="0" value="${data.amount || ''}" /></div><div class="field"><label>통화</label><select name="currency">${currency.map(x => `<option ${data.currency === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div><div class="field"><label>바우처 링크 (선택)</label><input name="voucher" value="${String(data.voucher || '').startsWith('data:') ? '' : escapeHtml(data.voucher || '')}" placeholder="https://..." /></div><div class="field"><label>바우처 파일 (오프라인 저장)</label><input name="voucherFile" type="file" accept=".pdf,.jpg,.jpeg,.png,image/*,application/pdf" /><small class="soft-note">5MB 이하 파일을 권장합니다.</small></div><div class="field full"><label>메모</label><input name="memo" value="${escapeHtml(data.memo || '')}" placeholder="예약번호, 체크인 조건" /></div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">취소</button>${item ? '<button type="button" class="button danger" data-action="delete-booking" data-id="' + item.id + '">삭제</button>' : ''}<button class="button primary" type="submit">저장하기</button></div></form>`; }
   function compareForm(item = null) { const data = item || { category: '숙소', vendor: '', quote: '', currency: 'KRW', pros: '', cons: '', status: '검토중' }; const currency = ['KRW', ...currentTrip().budget.currencies.map(x => x.code)]; return `<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">COMPARE</span><h2>${item ? '비교 항목 수정' : '비교 항목 추가'}</h2><p>최종 선택한 항목은 확인 후 예약과 예산에 연결할 수 있어요.</p><form id="compare-form" class="modal-form"><input type="hidden" name="id" value="${item?.id || ''}"/><div class="field"><label>분류</label><select name="category">${['항공권', '숙소', '교통', '투어', '보험', '유심', '기타'].map(x => `<option ${data.category === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div><div class="field"><label>상태</label><select name="status">${['검토중', '최종 후보', '선택 완료', '탈락'].map(x => `<option ${data.status === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div><div class="field full"><label>업체·상품명</label><input name="vendor" value="${escapeHtml(data.vendor)}" placeholder="예: Alila Seminyak" required /></div><div class="field"><label>견적 금액</label><input name="quote" type="number" min="0" value="${data.quote || ''}" /></div><div class="field"><label>통화</label><select name="currency">${currency.map(x => `<option ${data.currency === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div><div class="field full"><label>장점</label><textarea name="pros" placeholder="한 줄에 하나씩">${escapeHtml(data.pros || '')}</textarea></div><div class="field full"><label>확인할 점</label><textarea name="cons" placeholder="한 줄에 하나씩">${escapeHtml(data.cons || '')}</textarea></div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">취소</button>${item ? '<button type="button" class="button danger" data-action="delete-comparison" data-id="' + item.id + '">삭제</button>' : ''}<button class="button primary" type="submit" data-action="save-comparison">저장하기</button></div></form>`; }
@@ -446,7 +489,7 @@
       return;
     }
     if (action === 'edit-packing') { const item = currentTrip().packing.find(x => x.id === target.dataset.id); if (item) openModal(packingForm(item)); return; }
-    if (action === 'delete-packing') { if (confirm('이 준비물을 삭제할까요?')) { currentTrip().packing = currentTrip().packing.filter(x => x.id !== target.dataset.id); saveState(); closeModal(); render(); showToast('준비물을 삭제했어요.'); } return; }
+    if (action === 'delete-packing') { currentTrip().packing = currentTrip().packing.filter(x => x.id !== target.dataset.id); saveState(); closeModal(); render(); showToast('준비물을 삭제했어요.'); return; }
     if (action === 'cycle-packing') { const item = currentTrip().packing.find(x => x.id === target.dataset.id); if (item) { item.status = (Number(item.status || 0) + 1) % 3; saveState(); render(); } return; }
     if (action === 'toggle-packing-category') { const category = target.dataset.category; packingOpen[category] = packingOpen[category] === false; render(); return; }
     if (action === 'reset-packing') { if (confirm('모든 준비물 상태를 빈칸으로 초기화할까요?')) { currentTrip().packing.forEach(item => item.status = 0); saveState(); render(); showToast('준비물 상태를 초기화했어요.'); } return; }
@@ -459,6 +502,7 @@
     if (action === 'print-summary') { window.print(); return; }
     if (action === 'firebase-login') { firebaseLogin(); return; }
     if (action === 'firebase-logout') { firebaseLogout(); return; }
+    if (action === 'copy-invite') { navigator.clipboard?.writeText(target.dataset.link || '').then(() => showToast('초대 링크를 복사했어요.')).catch(() => showToast('링크를 길게 눌러 복사해 주세요.')); return; }
     if (action === 'refresh-travel-services') { fetchTravelServices(currentTrip()); showToast('날씨와 환율을 새로 조회했어요.'); return; }
   });
 
@@ -468,9 +512,18 @@
   document.addEventListener('submit', async event => {
     event.preventDefault(); const form = event.target; const data = Object.fromEntries(new FormData(form).entries()); const trip = currentTrip();
     if (form.id === 'trip-form') {
-      let photo = trip.photo; const file = form.photo.files?.[0]; if (file) photo = await new Promise(resolve => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.readAsDataURL(file); });
-      const item = form.id && data.id ? state.trips.find(x => x.id === data.id) : null; const target = item || normalizeTrip({ id: id('trip'), name: data.name, tagline: data.tagline, photo, couple: { a: data.coupleA, b: data.coupleB }, start: data.start, end: data.end, nights: nightsBetween(data.start, data.end), country: data.country, cities: data.cities.split(',').map(x => x.trim()).filter(Boolean), departureAirport: data.departureAirport, arrivalAirport: data.arrivalAirport, budget: { planned: Number(data.planned || 0), baseCurrency: 'KRW', currencies: clone(trip.budget.currencies) } });
-      Object.assign(target, { name: data.name, tagline: data.tagline, photo, couple: { a: data.coupleA, b: data.coupleB }, start: data.start, end: data.end, nights: nightsBetween(data.start, data.end), country: data.country, cities: data.cities.split(',').map(x => x.trim()).filter(Boolean), departureAirport: data.departureAirport, arrivalAirport: data.arrivalAirport }); target.budget.planned = Number(data.planned || 0); if (!item) { state.trips.push(target); state.currentTripId = target.id; selectedDate = target.start; calendarCursor = dateFromIso(selectedDate); } saveState(); closeModal(); render(); showToast(item ? '여행 정보를 수정했어요.' : '새 여행을 만들었어요.'); return;
+      try {
+        let photo = trip.photo; const file = form.elements.photo?.files?.[0];
+        if (file) photo = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = reject; reader.readAsDataURL(file); });
+        const cities = String(data.cities || '').split(',').map(x => x.trim()).filter(Boolean);
+        const item = data.id ? state.trips.find(x => x.id === data.id) : null;
+        const target = item || normalizeTrip({ id: id('trip'), name: data.name, tagline: data.tagline, photo, couple: { a: data.coupleA || '', b: data.coupleB || '' }, start: data.start, end: data.end, nights: nightsBetween(data.start, data.end), country: data.country || '', cities, departureAirport: data.departureAirport || '', arrivalAirport: data.arrivalAirport || '', budget: { planned: Number(data.planned || 0), baseCurrency: 'KRW', currencies: clone(trip.budget.currencies) } });
+        Object.assign(target, { name: data.name, tagline: data.tagline, photo, couple: { a: data.coupleA || '', b: data.coupleB || '' }, start: data.start, end: data.end, nights: nightsBetween(data.start, data.end), country: data.country || '', cities, departureAirport: data.departureAirport || '', arrivalAirport: data.arrivalAirport || '' });
+        target.budget = target.budget || { planned: 0, baseCurrency: 'KRW', currencies: [] }; target.budget.planned = Number(data.planned || 0);
+        if (!item) { state.trips.push(target); state.currentTripId = target.id; selectedDate = target.start; calendarCursor = dateFromIso(selectedDate); }
+        saveState(); closeModal(); render(); showToast(item ? '여행 정보를 수정했어요.' : '새 여행을 만들었어요.');
+      } catch (error) { console.warn('여행 저장에 실패했습니다.', error); showToast('여행 정보를 저장하지 못했어요. 입력 내용을 확인해 주세요.'); }
+      return;
     }
     if (form.id === 'schedule-form') { const value = { date: data.date, time: data.time, title: data.title, kind: data.kind, place: data.place, transport: data.transport, note: data.note, bookingId: data.bookingId }; if (data.id) Object.assign(trip.schedule.find(x => x.id === data.id), value); else trip.schedule.push({ id: id('schedule'), ...value }); selectedDate = data.date; calendarCursor = dateFromIso(data.date); saveState(); closeModal(); render(); showToast('일정을 저장했어요.'); return; }
     if (form.id === 'booking-form') {
@@ -498,7 +551,7 @@
       saveState(); closeModal(); render(); showToast(previous ? '준비물 분류를 수정했어요.' : '준비물 분류를 추가했어요.'); return;
     }
     if (form.id === 'diary-form') { const value = { date: data.date, title: data.title, text: data.text }; if (data.id) Object.assign(trip.diary.find(x => x.id === data.id), value); else trip.diary.push({ id: id('diary'), ...value }); saveState(); closeModal(); render(); showToast('여행 기록을 저장했어요.'); return; }
-    if (form.id === 'invite-form') { const email = data.email; trip.members.push({ name: email.split('@')[0], email, role: '초대 대기' }); saveState(); closeModal(); render(); showToast('파트너 초대 링크를 만들었어요.'); return; }
+    if (form.id === 'invite-form') { await createPartnerInvite(data.email); return; }
     if (form.id === 'currency-form') { const code = data.code.toUpperCase(); if (!trip.budget.currencies.some(x => x.code === code)) trip.budget.currencies.push({ code, name: data.name, rate: Number(data.rate || 0) }); saveState(); closeModal(); render(); showToast(`${code} 통화를 추가했어요.`); return; }
   });
 
