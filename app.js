@@ -579,7 +579,7 @@
 
   document.getElementById('modal-backdrop').addEventListener('click', event => { if (event.target.id === 'modal-backdrop') closeModal(); });
   document.addEventListener('keydown', event => { if (event.key === 'Escape') closeModal(); });
-  if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js?v=20260917-2').catch(() => {});
+  if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js?v=20260917-3').catch(() => {});
   initFirebase();
   render();
 })();

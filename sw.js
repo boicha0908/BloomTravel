@@ -1,4 +1,4 @@
-const CACHE_NAME = 'bloom-travel-v8';
+const CACHE_NAME = 'bloom-travel-v9';
 const APP_SHELL = [
   './', './index.html', './styles.css', './app.js', './firebase-config.js', './manifest.json', './bloom-travel-plane.svg',
   './참고자료/웹사이트아이콘.png', './참고자료/커플-프로필.png'
