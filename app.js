@@ -17,7 +17,10 @@
   const FIREBASE_CONFIG = window.BLOOM_FIREBASE_CONFIG || {};
   const cloud = { app: null, auth: null, db: null, user: null, saveTimer: null, hydrated: false };
   const initFirebase = () => {
-    if (!window.firebase || !FIREBASE_CONFIG.projectId) return;
+    if (!window.firebase || !FIREBASE_CONFIG.projectId) {
+      updateSyncPill(FIREBASE_CONFIG.projectId ? 'Firebase 연결 대기 중' : 'Firebase 설정 필요');
+      return false;
+    }
     try {
       cloud.app = window.firebase.apps?.length ? window.firebase.app() : window.firebase.initializeApp(FIREBASE_CONFIG);
       cloud.auth = window.firebase.auth();
@@ -28,7 +31,8 @@
         if (user) hydrateCloudState(user);
         else { cloud.hydrated = false; updateSyncPill('이 기기에 저장 중'); }
       });
-    } catch (error) { console.warn('Firebase 초기화에 실패했습니다.', error); }
+      return true;
+    } catch (error) { console.warn('Firebase 초기화에 실패했습니다.', error); return false; }
   };
   const updateSyncPill = text => { const node = document.querySelector('.sync-pill span'); if (node) node.textContent = text; };
   const updateAccountChrome = () => {
@@ -334,7 +338,8 @@
     openModal(`<button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">ACCOUNT & SHARING</span><h2>계정과 파트너 초대</h2><p>Google 로그인 후 여행 데이터가 안전하게 동기화됩니다.</p>${identity}<div class="member-list">${trip.members.map(member => `<div class="member-row"><div><strong>${escapeHtml(member.name)}</strong><small>${escapeHtml(member.email)}</small></div><span class="tag">${escapeHtml(member.role)}</span></div>`).join('')}</div><form id="invite-form" class="modal-form" style="margin-top:15px"><div class="field full"><label>파트너 이메일</label><input name="email" type="email" placeholder="partner@example.com" required /></div><div class="modal-actions"><button class="button primary" type="submit">초대 링크 만들기</button></div></form><div class="modal-actions"><button class="button ghost" data-action="close-modal">닫기</button>${action}</div>`);
   }
   async function firebaseLogin() {
-    if (!cloud.auth) { showToast('Firebase 설정을 먼저 확인해 주세요.'); return; }
+    if (!cloud.auth) initFirebase();
+    if (!cloud.auth) { showToast('Firebase SDK가 아직 로드되지 않았어요. 페이지를 새로고침해 주세요.'); return; }
     try {
       const provider = new window.firebase.auth.GoogleAuthProvider();
       await cloud.auth.signInWithPopup(provider);
@@ -499,7 +504,7 @@
 
   document.getElementById('modal-backdrop').addEventListener('click', event => { if (event.target.id === 'modal-backdrop') closeModal(); });
   document.addEventListener('keydown', event => { if (event.key === 'Escape') closeModal(); });
-  if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
+  if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js?v=20260917-2').catch(() => {});
   initFirebase();
   render();
 })();
