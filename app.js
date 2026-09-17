@@ -192,6 +192,36 @@
   let toastTimer;
 
   function currentTrip() { return state.trips.find(t => t.id === state.currentTripId) || state.trips[0]; }
+  const isDemoOwner = member => {
+    const email = String(member?.email || '').trim().toLowerCase();
+    const name = String(member?.name || '').trim();
+    return email === 'owner@bloom.travel' || name === '민준 · 서연';
+  };
+  function applySignedInOwner(user) {
+    if (!user?.email) return false;
+    const email = String(user.email).trim().toLowerCase();
+    const name = String(user.displayName || user.email.split('@')[0] || '여행 생성자').trim();
+    let changed = false;
+    state.trips.forEach(trip => {
+      const members = Array.isArray(trip.members) ? trip.members : [];
+      const hasDemoOwner = members.some(isDemoOwner);
+      const belongsToUser = !trip.ownerUid || trip.ownerUid === user.uid;
+      if (belongsToUser) {
+        const before = JSON.stringify({ ownerUid: trip.ownerUid, members: trip.members });
+        const others = members
+          .filter(member => !isDemoOwner(member) && String(member.email || '').trim().toLowerCase() !== email && member.uid !== user.uid)
+          .map(member => member.role === '여행 생성자' ? { ...member, role: '파트너' } : member);
+        trip.ownerUid = user.uid;
+        trip.members = [{ name, email, role: '여행 생성자', uid: user.uid }, ...others];
+        trip.memberIds = [...new Set([...(trip.memberIds || []), user.uid])];
+        if (before !== JSON.stringify({ ownerUid: trip.ownerUid, members: trip.members })) changed = true;
+      } else if (hasDemoOwner) {
+        trip.members = members.filter(member => !isDemoOwner(member));
+        changed = true;
+      }
+    });
+    return changed;
+  }
   function cloudTripPayload(trip) {
     const memberIds = [...new Set([...(Array.isArray(trip.memberIds) ? trip.memberIds : []), cloud.user?.uid].filter(Boolean))];
     return { ...clone(trip), ownerUid: trip.ownerUid || cloud.user?.uid || '', memberIds, updatedAt: window.firebase.firestore.FieldValue.serverTimestamp() };
@@ -219,12 +249,14 @@
         const isInviteFlow = new URLSearchParams(window.location.search).has('invite');
         if (!isInviteFlow) {
           state.trips.forEach(trip => { trip.ownerUid = user.uid; trip.memberIds = [...new Set([...(trip.memberIds || []), user.uid])]; });
+          applySignedInOwner(user);
           queueCloudSave();
         }
       } else {
         const trips = snapshot.docs.map(doc => normalizeTrip({ id: doc.id, ...doc.data() }));
         state.trips = trips.length ? trips : state.trips;
         if (!state.trips.some(trip => trip.id === state.currentTripId)) state.currentTripId = state.trips[0].id;
+        applySignedInOwner(user);
         saveState(false);
       }
       cloud.hydrated = true;
