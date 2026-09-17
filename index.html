@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#8d76ad" />
+  <meta name="description" content="BLOOM TRAVEL · 우리의 여행을 준비하고 기록하는 공간" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="bloom-travel-plane.svg" />
+  <link rel="stylesheet" href="styles.css?v=20260917-4" />
+  <title>BLOOM TRAVEL · 여행 플래너</title>
+</head>
+<body>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <header class="topbar">
+    <div class="header-tools">
+      <button class="icon-button menu-toggle" data-action="toggle-sidebar" aria-label="메뉴 열기">☰</button>
+      <button class="icon-button" data-view="dashboard" aria-label="대시보드로 이동">⌂</button>
+    </div>
+    <div class="wordmark" aria-label="BLOOM TRAVEL"><strong>BLOOM</strong><span>TRAVEL</span></div>
+    <div class="top-actions">
+      <span class="sync-pill"><i></i><span>이 기기에 저장 중</span></span>
+      <button class="icon-button notification-button" data-action="show-notifications" aria-label="알림">♢<b id="notification-count" hidden>0</b></button>
+      <button class="header-profile" data-action="open-account" aria-label="계정"><img id="header-avatar" src="참고자료/웹사이트아이콘.png" alt="내 프로필" /></button>
+    </div>
+  </header>
+
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-primary">
+        <button class="mobile-close" data-action="toggle-sidebar" aria-label="메뉴 닫기">×</button>
+        <button class="trip-switcher" data-action="open-trip-manager">
+          <span class="trip-switcher-photo"><img id="sidebar-avatar" src="참고자료/커플-프로필.png" alt="현재 여행 사진" /></span>
+          <span class="trip-switcher-copy"><strong id="sidebar-trip-name">발리 신혼여행</strong><small id="sidebar-trip-meta">5박 7일 · 준비 중</small></span>
+          <b>⌄</b>
+        </button>
+        <nav class="primary-nav" aria-label="주요 메뉴">
+          <button class="nav-item active" data-view="dashboard"><span class="nav-icon">⌂</span><span>대시보드</span></button>
+          <button class="nav-item" data-view="itinerary"><span class="nav-icon">▦</span><span>여행 일정</span></button>
+          <div class="nav-group" data-group="planning">
+            <button class="nav-item" data-view="planning"><span class="nav-icon">✓</span><span>여행 플래닝</span><b class="nav-chevron">›</b></button>
+            <div class="subnav">
+              <button data-view="planning" data-planning-tab="bookings">예약 관리</button>
+              <button data-view="planning" data-planning-tab="budget">예산·정산</button>
+              <button data-view="planning" data-planning-tab="compare">비교하기</button>
+              <button data-view="planning" data-planning-tab="checklist">체크리스트</button>
+            </div>
+          </div>
+          <button class="nav-item" data-view="trip-mode"><span class="nav-icon">✦</span><span>여행 중</span><em id="today-badge" hidden>0</em></button>
+          <button class="nav-item" data-view="memories"><span class="nav-icon">♡</span><span>추억·결산</span></button>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="help-card"><span>✦</span><strong>오늘의 여행 준비</strong><p id="sidebar-tip">작은 준비가 편안한 여행을 만들어요.</p></div>
+          <button class="settings-link" data-action="open-account">⚙ 계정·초대·설정</button>
+        </div>
+      </div>
+    </aside>
+    <div class="page-wrap"><main id="main-content" tabindex="-1"></main></div>
+  </div>
+
+  <div class="modal-backdrop" id="modal-backdrop" hidden><section class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"></section></div>
+  <script src="app.js?v=20260917-6"></script>
+</body>
+</html>

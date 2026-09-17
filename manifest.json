@@ -1,0 +1,13 @@
+{
+  "name": "BLOOM TRAVEL",
+  "short_name": "BLOOM TRAVEL",
+  "description": "우리의 여행을 준비하고 기록하는 공간",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#fbf8f2",
+  "theme_color": "#8d76ad",
+  "lang": "ko",
+  "icons": [
+    { "src": "bloom-travel-plane.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
